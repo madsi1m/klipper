@@ -79,6 +79,9 @@ console_task(void)
     if (ret > 0)
         command_dispatch(receive_buf, pop_count);
     if (ret) {
+        if (CONFIG_HAVE_BOOTLOADER_REQUEST && ret < 0 && pop_count == 32
+            && !memcmp(receive_buf, " \x1c Request Serial Bootloader!! ~", 32))
+            bootloader_request();
         console_pop_input(pop_count);
         if (ret > 0)
             command_send_ack();
@@ -97,9 +100,8 @@ console_sendf(const struct command_encoder *ce, va_list args)
         writeb(&transmit_max, 0);
         writeb(&transmit_pos, 0);
     }
-    uint_fast8_t max_size = READP(ce->max_size);
-    if (tmax + max_size > sizeof(transmit_buf)) {
-        if (tmax + max_size - tpos > sizeof(transmit_buf))
+    if (tmax + READP(ce->max_size) > sizeof(transmit_buf)) {
+        if (tmax - tpos + READP(ce->min_size) > sizeof(transmit_buf))
             // Not enough space for message
             return;
         // Disable TX irq and move buffer
@@ -114,7 +116,10 @@ console_sendf(const struct command_encoder *ce, va_list args)
 
     // Generate message
     uint8_t *buf = &transmit_buf[tmax];
-    uint_fast8_t msglen = command_encode_and_frame(buf, ce, args);
+    uint_fast8_t msglen = command_encode_and_frame(
+        buf, sizeof(transmit_buf) - tmax, ce, args);
+    if (!msglen)
+        return;
 
     // Start message transmit
     writeb(&transmit_max, tmax + msglen);

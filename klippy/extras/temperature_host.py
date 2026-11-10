@@ -18,26 +18,29 @@ class Temperature_HOST:
 
         self.temp = self.min_temp = self.max_temp = 0.0
 
-        if config.get("sensor_type", "", note_valid=False).startswith('rpi'):
-            # Temporary backwards compatibility
-            self.printer.add_object("rpi_temperature " + self.name, self)
-        else:
-            self.printer.add_object("temperature_host " + self.name, self)
+        self.printer.add_object("temperature_host " + self.name, self)
         if self.printer.get_start_args().get('debugoutput') is not None:
             return
         self.sample_timer = self.reactor.register_timer(
             self._sample_pi_temperature)
+        aio = self.printer.load_object(config, 'aio_executor')
+        self.executor = aio.allocate_executor("temperature_host")
         try:
-            self.file_handle = open(self.path, "r")
+            self.file_handle = self.executor.submit(open, self.path, "r")
         except:
             raise config.error("Unable to open temperature file '%s'"
                                % (self.path,))
 
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
+        self.printer.register_event_handler("klippy:disconnect",
+                                            self.handle_disconnect)
 
     def handle_connect(self):
         self.reactor.update_timer(self.sample_timer, self.reactor.NOW)
+
+    def handle_disconnect(self):
+        self.file_handle.close()
 
     def setup_minmax(self, min_temp, max_temp):
         self.min_temp = min_temp
@@ -50,9 +53,12 @@ class Temperature_HOST:
         return HOST_REPORT_TIME
 
     def _sample_pi_temperature(self, eventtime):
-        try:
+        def _get_sample():
             self.file_handle.seek(0)
-            self.temp = float(self.file_handle.read())/1000.0
+            return self.file_handle.read()
+        try:
+            raw_value = self.executor.submit(_get_sample)
+            self.temp = float(raw_value)/1000.0
         except Exception:
             logging.exception("temperature_host: Error reading data")
             self.temp = 0.0
@@ -74,7 +80,7 @@ class Temperature_HOST:
 
     def get_status(self, eventtime):
         return {
-            'temperature': self.temp,
+            'temperature': round(self.temp, 2),
         }
 
 
@@ -82,4 +88,3 @@ def load_config(config):
     # Register sensor
     pheaters = config.get_printer().load_object(config, "heaters")
     pheaters.add_sensor_factory("temperature_host", Temperature_HOST)
-    pheaters.add_sensor_factory("rpi_temperature", Temperature_HOST) # XXX

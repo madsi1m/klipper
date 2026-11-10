@@ -9,6 +9,7 @@
 #include "gpio.h" // i2c_setup
 #include "internal.h" // gpio_peripheral
 #include "sched.h" // sched_shutdown
+#include "i2ccmds.h" // I2C_BUS_SUCCESS
 
 struct i2c_info {
     LPC_I2C_TypeDef *i2c;
@@ -100,6 +101,20 @@ i2c_send_byte(LPC_I2C_TypeDef *i2c, uint8_t b, uint32_t timeout)
     return i2c->I2STAT;
 }
 
+static uint8_t
+i2c_read_byte(LPC_I2C_TypeDef *i2c, uint32_t timeout, uint8_t remaining)
+{
+  if (remaining == 0)
+      i2c->I2CONCLR = IF_ACK | IF_IRQ;
+  else {
+      i2c->I2CONSET = IF_ACK;
+      i2c->I2CONCLR = IF_IRQ;
+  }
+  i2c_wait(i2c, IF_IRQ, timeout);
+  uint8_t b = i2c->I2DAT;
+  return b;
+}
+
 static void
 i2c_stop(LPC_I2C_TypeDef *i2c, uint32_t timeout)
 {
@@ -108,7 +123,7 @@ i2c_stop(LPC_I2C_TypeDef *i2c, uint32_t timeout)
     i2c_wait(i2c, IF_STOP, timeout);
 }
 
-void
+int
 i2c_write(struct i2c_config config, uint8_t write_len, uint8_t *write)
 {
     LPC_I2C_TypeDef *i2c = config.i2c;
@@ -119,11 +134,34 @@ i2c_write(struct i2c_config config, uint8_t write_len, uint8_t *write)
     while (write_len--)
         i2c_send_byte(i2c, *write++, timeout);
     i2c_stop(i2c, timeout);
+
+    return I2C_BUS_SUCCESS;
 }
 
-void
+int
 i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
          , uint8_t read_len, uint8_t *read)
 {
-    shutdown("i2c_read not supported on lpc176x");
+    LPC_I2C_TypeDef *i2c = config.i2c;
+    uint32_t timeout = timer_read_time() + timer_from_us(5000);
+    uint8_t addr = config.addr | 0x01;
+
+    if (reg_len != 0) {
+        // write the register
+        i2c_start(i2c, timeout);
+        i2c_send_byte(i2c, config.addr, timeout);
+        while(reg_len--)
+            i2c_send_byte(i2c, *reg++, timeout);
+        i2c_stop(i2c, timeout);
+    }
+    // start/re-start and read data
+    i2c_start(i2c, timeout);
+    i2c_send_byte(i2c, addr, timeout);
+    while(read_len--) {
+        *read = i2c_read_byte(i2c, timeout, read_len);
+        read++;
+    }
+    i2c_stop(i2c, timeout);
+
+    return I2C_BUS_SUCCESS;
 }

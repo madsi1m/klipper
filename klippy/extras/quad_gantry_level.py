@@ -1,4 +1,4 @@
-# Mechanicaly conforms a moving gantry to the bed with 4 Z steppers
+# Mechanically conforms a moving gantry to the bed with 4 Z steppers
 #
 # Copyright (C) 2018  Maks Zolin <mzolin@vorondesign.com>
 #
@@ -33,16 +33,10 @@ class QuadGantryLevel:
         if len(self.probe_helper.probe_points) != 4:
             raise config.error(
                 "Need exactly 4 probe points for quad_gantry_level")
+        self.z_status = z_tilt.ZAdjustStatus(self.printer)
         self.z_helper = z_tilt.ZAdjustHelper(config, 4)
-        gantry_corners = config.get('gantry_corners').split('\n')
-        try:
-            gantry_corners = [line.split(',', 1)
-                           for line in gantry_corners if line.strip()]
-            self.gantry_corners = [(float(zp[0].strip()), float(zp[1].strip()))
-                                for zp in gantry_corners]
-        except:
-            raise config.error("Unable to parse gantry_corners in %s" % (
-                config.get_name()))
+        self.gantry_corners = config.getlists('gantry_corners', parser=float,
+                                              seps=(',', '\n'), count=2)
         if len(self.gantry_corners) < 2:
             raise config.error(
                 "quad_gantry_level requires at least two gantry_corners")
@@ -54,36 +48,37 @@ class QuadGantryLevel:
     cmd_QUAD_GANTRY_LEVEL_help = (
         "Conform a moving, twistable gantry to the shape of a stationary bed")
     def cmd_QUAD_GANTRY_LEVEL(self, gcmd):
+        self.z_status.reset()
         self.retry_helper.start(gcmd)
         self.probe_helper.start_probe(gcmd)
-    def probe_finalize(self, offsets, positions):
+    def probe_finalize(self, positions):
         # Mirror our perspective so the adjustments make sense
         # from the perspective of the gantry
-        z_positions = [self.horizontal_move_z - p[2] for p in positions]
+        z_positions = [self.horizontal_move_z - p.bed_z for p in positions]
         points_message = "Gantry-relative probe points:\n%s\n" % (
             " ".join(["%s: %.6f" % (z_id, z_positions[z_id])
                 for z_id in range(len(z_positions))]))
         self.gcode.respond_info(points_message)
         # Calculate slope along X axis between probe point 0 and 3
-        ppx0 = [positions[0][0] + offsets[0], z_positions[0]]
-        ppx3 = [positions[3][0] + offsets[0], z_positions[3]]
+        ppx0 = [positions[0].bed_x, z_positions[0]]
+        ppx3 = [positions[3].bed_x, z_positions[3]]
         slope_x_pp03 = self.linefit(ppx0, ppx3)
         # Calculate slope along X axis between probe point 1 and 2
-        ppx1 = [positions[1][0] + offsets[0], z_positions[1]]
-        ppx2 = [positions[2][0] + offsets[0], z_positions[2]]
+        ppx1 = [positions[1].bed_x, z_positions[1]]
+        ppx2 = [positions[2].bed_x, z_positions[2]]
         slope_x_pp12 = self.linefit(ppx1, ppx2)
         logging.info("quad_gantry_level f1: %s, f2: %s"
                      % (slope_x_pp03, slope_x_pp12))
         # Calculate gantry slope along Y axis between stepper 0 and 1
-        a1 = [positions[0][1] + offsets[1],
+        a1 = [positions[0].bed_y,
               self.plot(slope_x_pp03, self.gantry_corners[0][0])]
-        a2 = [positions[1][1] + offsets[1],
+        a2 = [positions[1].bed_y,
               self.plot(slope_x_pp12, self.gantry_corners[0][0])]
         slope_y_s01 = self.linefit(a1, a2)
         # Calculate gantry slope along Y axis between stepper 2 and 3
-        b1 = [positions[0][1] + offsets[1],
+        b1 = [positions[0].bed_y,
               self.plot(slope_x_pp03, self.gantry_corners[1][0])]
-        b2 = [positions[1][1] + offsets[1],
+        b2 = [positions[1].bed_y,
               self.plot(slope_x_pp12, self.gantry_corners[1][0])]
         slope_y_s23 = self.linefit(b1, b2)
         logging.info("quad_gantry_level af: %s, bf: %s"
@@ -114,7 +109,9 @@ class QuadGantryLevel:
 
         speed = self.probe_helper.get_lift_speed()
         self.z_helper.adjust_steppers(z_adjust, speed)
-        return self.retry_helper.check_retry(z_positions)
+        return self.z_status.check_retry_result(
+            self.retry_helper.check_retry(z_positions))
+
     def linefit(self,p1,p2):
         if p1[1] == p2[1]:
             # Straight line
@@ -124,6 +121,8 @@ class QuadGantryLevel:
         return m,b
     def plot(self,f,x):
         return f[0]*x + f[1]
+    def get_status(self, eventtime):
+        return self.z_status.get_status(eventtime)
 
 def load_config(config):
     return QuadGantryLevel(config)

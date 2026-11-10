@@ -10,7 +10,7 @@ from . import font8x14
 
 BACKGROUND_PRIORITY_CLOCK = 0x7fffffff00000000
 
-TextGlyphs = { 'right_arrow': '\x1a', 'degrees': '\xf8' }
+TextGlyphs = { 'right_arrow': b'\x1a', 'degrees': b'\xf8' }
 
 class DisplayBase:
     def __init__(self, io, columns=128, x_offset=0):
@@ -19,7 +19,7 @@ class DisplayBase:
         self.columns = columns
         self.x_offset = x_offset
         self.vram = [bytearray(self.columns) for i in range(8)]
-        self.all_framebuffers = [(self.vram[i], bytearray('~'*self.columns), i)
+        self.all_framebuffers = [(self.vram[i], bytearray(b'~'*self.columns), i)
                                  for i in range(8)]
         # Cache fonts and icons in display byte order
         self.font = [self._swizzle_bits(bytearray(c))
@@ -130,7 +130,8 @@ class SPI4wire:
 class I2C:
     def __init__(self, config, default_addr):
         self.i2c = bus.MCU_I2C_from_config(config, default_addr=default_addr,
-                                           default_speed=400000)
+                                           default_speed=400000,
+                                           async_write_only=True)
     def send(self, cmds, is_data=False):
         if is_data:
             hdr = 0x40
@@ -138,7 +139,7 @@ class I2C:
             hdr = 0x00
         cmds = bytearray(cmds)
         cmds.insert(0, hdr)
-        self.i2c.i2c_write(cmds, reqclock=BACKGROUND_PRIORITY_CLOCK)
+        self.i2c.i2c_write_noack(cmds, reqclock=BACKGROUND_PRIORITY_CLOCK)
 
 # Helper code for toggling a reset pin on startup
 class ResetHelper:

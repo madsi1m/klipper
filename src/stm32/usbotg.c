@@ -1,6 +1,6 @@
 // Hardware interface to "USB OTG (on the go) controller" on stm32
 //
-// Copyright (C) 2019  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2019-2025  Kevin O'Connor <kevin@koconnor.net>
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
@@ -14,16 +14,44 @@
 #include "internal.h" // GPIO
 #include "sched.h" // DECL_INIT
 
+#if CONFIG_STM32_USB_PB14_PB15
+  #define IS_OTG_HS 1
+  #define GPIO_D_NEG GPIO('B', 14)
+  #define GPIO_D_POS GPIO('B', 15)
+  #define GPIO_FUNC GPIO_FUNCTION(12)
+  DECL_CONSTANT_STR("RESERVE_PINS_USB1", "PB14,PB15");
+#else
+  #if CONFIG_MACH_STM32H723
+    #define IS_OTG_HS 1
+  #else
+    #define IS_OTG_HS 0
+  #endif
+  #define GPIO_D_NEG GPIO('A', 11)
+  #define GPIO_D_POS GPIO('A', 12)
+  #define GPIO_FUNC GPIO_FUNCTION(10)
+  DECL_CONSTANT_STR("RESERVE_PINS_USB", "PA11,PA12");
+#endif
+
+#if IS_OTG_HS
+  #define USB_PERIPH_BASE USB_OTG_HS_PERIPH_BASE
+  #define OTG_IRQn OTG_HS_IRQn
+  #define USBOTGEN RCC_AHB1ENR_USB1OTGHSEN
+#else
+  #define USB_PERIPH_BASE USB_OTG_FS_PERIPH_BASE
+  #define OTG_IRQn OTG_FS_IRQn
+  #define USBOTGEN RCC_AHB1ENR_USB2OTGHSEN
+#endif
+
 static void
 usb_irq_disable(void)
 {
-    NVIC_DisableIRQ(OTG_FS_IRQn);
+    NVIC_DisableIRQ(OTG_IRQn);
 }
 
 static void
 usb_irq_enable(void)
 {
-    NVIC_EnableIRQ(OTG_FS_IRQn);
+    NVIC_EnableIRQ(OTG_IRQn);
 }
 
 
@@ -31,17 +59,13 @@ usb_irq_enable(void)
  * USB transfer memory
  ****************************************************************/
 
-#define OTG ((USB_OTG_GlobalTypeDef*)USB_OTG_FS_PERIPH_BASE)
-#define OTGD ((USB_OTG_DeviceTypeDef*)                          \
-              (USB_OTG_FS_PERIPH_BASE + USB_OTG_DEVICE_BASE))
-#define EPFIFO(EP) ((void*)(USB_OTG_FS_PERIPH_BASE + USB_OTG_FIFO_BASE  \
-                            + ((EP) << 12)))
+#define OTG ((USB_OTG_GlobalTypeDef*)USB_PERIPH_BASE)
+#define OTGD ((USB_OTG_DeviceTypeDef*)(USB_PERIPH_BASE + USB_OTG_DEVICE_BASE))
+#define EPFIFO(EP) ((void*)(USB_PERIPH_BASE + USB_OTG_FIFO_BASE + ((EP) << 12)))
 #define EPIN(EP) ((USB_OTG_INEndpointTypeDef*)                          \
-                  (USB_OTG_FS_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE    \
-                   + ((EP) << 5)))
+                  (USB_PERIPH_BASE + USB_OTG_IN_ENDPOINT_BASE + ((EP) << 5)))
 #define EPOUT(EP) ((USB_OTG_OUTEndpointTypeDef*)                        \
-                   (USB_OTG_FS_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE  \
-                    + ((EP) << 5)))
+                   (USB_PERIPH_BASE + USB_OTG_OUT_ENDPOINT_BASE + ((EP) << 5)))
 
 // Setup the USB fifos
 static void
@@ -93,6 +117,24 @@ fifo_write_packet(uint32_t ep, const uint8_t *src, uint32_t len)
         writel(fifo, data);
     }
     return len;
+}
+
+// Write a packet to a tx fifo (optimized for already aligned data)
+static int
+fifo_write_packet_fast(uint32_t ep, const uint32_t *src, uint32_t len)
+{
+    void *fifo = EPFIFO(ep);
+    USB_OTG_INEndpointTypeDef *epi = EPIN(ep);
+    uint32_t ctl = epi->DIEPCTL;
+    if (ctl & USB_OTG_DIEPCTL_EPENA)
+        return -1;
+    epi->DIEPINT = USB_OTG_DIEPINT_XFRC;
+    epi->DIEPTSIZ = len | (1 << USB_OTG_DIEPTSIZ_PKTCNT_Pos);
+    epi->DIEPCTL = ctl | USB_OTG_DIEPCTL_EPENA | USB_OTG_DIEPCTL_CNAK;
+    uint32_t i;
+    for (i=0; i < DIV_ROUND_UP(len, sizeof(uint32_t)); i++)
+        writel(fifo, src[i]);
+    return 0;
 }
 
 // Read a packet from the rx queue
@@ -184,6 +226,12 @@ usb_read_bulk_out(void *data, uint_fast8_t max_len)
     return ret;
 }
 
+// Storage for "bulk in" transmissions for a kind of manual "double buffering"
+static struct {
+    uint32_t len;
+    uint32_t buf[USB_CDC_EP_BULK_IN_SIZE / sizeof(uint32_t)];
+} TX_BUF;
+
 int_fast8_t
 usb_send_bulk_in(void *data, uint_fast8_t len)
 {
@@ -194,11 +242,23 @@ usb_send_bulk_in(void *data, uint_fast8_t len)
         usb_irq_enable();
         return len;
     }
-    if (ctl & USB_OTG_DIEPCTL_EPENA) {
-        // Wait for space to transmit
+    int dbuf_busy = CONFIG_STM32_USB_DOUBLE_BUFFER_TX && TX_BUF.len;
+    if (ctl & USB_OTG_DIEPCTL_EPENA || dbuf_busy) {
+        if (!CONFIG_STM32_USB_DOUBLE_BUFFER_TX || TX_BUF.len || !len) {
+            // Wait for space to transmit
+            OTGD->DAINTMSK |= 1 << USB_CDC_EP_BULK_IN;
+            usb_irq_enable();
+            return -1;
+        }
+        // Buffer next packet for transmission from irq handler
+        len = len > USB_CDC_EP_BULK_IN_SIZE ? USB_CDC_EP_BULK_IN_SIZE : len;
+        uint32_t blocks = DIV_ROUND_UP(len, sizeof(uint32_t));
+        TX_BUF.buf[blocks-1] = 0;
+        memcpy(TX_BUF.buf, data, len);
+        TX_BUF.len = len;
         OTGD->DAINTMSK |= 1 << USB_CDC_EP_BULK_IN;
         usb_irq_enable();
-        return -1;
+        return len;
     }
     int_fast8_t ret = fifo_write_packet(USB_CDC_EP_BULK_IN, data, len);
     usb_irq_enable();
@@ -349,6 +409,8 @@ usb_set_configure(void)
                     | USB_OTG_GRSTCTL_TXFFLSH);
     while (OTG->GRSTCTL & USB_OTG_GRSTCTL_TXFFLSH)
         ;
+    if (CONFIG_STM32_USB_DOUBLE_BUFFER_TX)
+        TX_BUF.len = 0;
     usb_irq_enable();
 }
 
@@ -373,23 +435,35 @@ OTG_FS_IRQHandler(void)
     }
     if (sts & USB_OTG_GINTSTS_IEPINT) {
         // Can transmit data - disable irq and notify endpoint
-        uint32_t daint = OTGD->DAINT;
-        OTGD->DAINTMSK &= ~daint;
-        if (daint & (1 << 0))
+        uint32_t daint = OTGD->DAINT, msk = OTGD->DAINTMSK, pend = daint & msk;
+        OTGD->DAINTMSK = msk & ~daint;
+        if (pend & (1 << 0))
             usb_notify_ep0();
-        if (daint & (1 << USB_CDC_EP_BULK_IN))
+        if (pend & (1 << USB_CDC_EP_BULK_IN)) {
             usb_notify_bulk_in();
+            if (CONFIG_STM32_USB_DOUBLE_BUFFER_TX && TX_BUF.len) {
+                int ret = fifo_write_packet_fast(USB_CDC_EP_BULK_IN
+                                                 , TX_BUF.buf, TX_BUF.len);
+                if (!ret)
+                    TX_BUF.len = 0;
+            }
+        }
     }
 }
-
-DECL_CONSTANT_STR("RESERVE_PINS_USB", "PA11,PA12");
 
 // Initialize the usb controller
 void
 usb_init(void)
 {
     // Enable USB clock
+#if CONFIG_MACH_STM32H7
+    if (READ_BIT(PWR->CR3, PWR_CR3_USB33RDY) != (PWR_CR3_USB33RDY)) {
+        SET_BIT(PWR->CR3, PWR_CR3_USB33DEN);
+    }
+    SET_BIT(RCC->AHB1ENR, USBOTGEN);
+#else
     RCC->AHB2ENR |= RCC_AHB2ENR_OTGFSEN;
+#endif
     while (!(OTG->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL))
         ;
 
@@ -397,15 +471,15 @@ usb_init(void)
     OTG->GUSBCFG = (USB_OTG_GUSBCFG_FDMOD | USB_OTG_GUSBCFG_PHYSEL
                     | (6 << USB_OTG_GUSBCFG_TRDT_Pos));
     OTGD->DCFG |= (3 << USB_OTG_DCFG_DSPD_Pos);
-#if CONFIG_MACH_STM32F446
+#if CONFIG_MACH_STM32F446 || CONFIG_MACH_STM32H7 || CONFIG_MACH_STM32F7
     OTG->GOTGCTL = USB_OTG_GOTGCTL_BVALOEN | USB_OTG_GOTGCTL_BVALOVAL;
 #else
     OTG->GCCFG |= USB_OTG_GCCFG_NOVBUSSENS;
 #endif
 
     // Route pins
-    gpio_peripheral(GPIO('A', 11), GPIO_FUNCTION(10), 0);
-    gpio_peripheral(GPIO('A', 12), GPIO_FUNCTION(10), 0);
+    gpio_peripheral(GPIO_D_NEG, GPIO_FUNC, 0);
+    gpio_peripheral(GPIO_D_POS, GPIO_FUNC, 0);
 
     // Setup USB packet memory
     fifo_configure();
@@ -423,7 +497,7 @@ usb_init(void)
     OTGD->DIEPMSK = USB_OTG_DIEPMSK_XFRCM;
     OTG->GINTMSK = USB_OTG_GINTMSK_RXFLVLM | USB_OTG_GINTMSK_IEPINT;
     OTG->GAHBCFG = USB_OTG_GAHBCFG_GINT;
-    armcm_enable_irq(OTG_FS_IRQHandler, OTG_FS_IRQn, 1);
+    armcm_enable_irq(OTG_FS_IRQHandler, OTG_IRQn, 1);
 
     // Enable USB
     OTG->GCCFG |= USB_OTG_GCCFG_PWRDWN;

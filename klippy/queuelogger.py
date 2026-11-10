@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2019  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, logging.handlers, threading, Queue as queue, time
+import logging, logging.handlers, threading, queue, time
 
 # Class to forward all messages through a queue to a background thread
 class QueueHandler(logging.Handler):
@@ -46,7 +46,10 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
     def clear_rollover_info(self):
         self.rollover_info.clear()
     def doRollover(self):
+        before = self.rolloverAt
         logging.handlers.TimedRotatingFileHandler.doRollover(self)
+        if self.rolloverAt <= before:
+            return
         lines = [self.rollover_info[name]
                  for name in sorted(self.rollover_info)]
         lines.append(
@@ -59,6 +62,12 @@ MainQueueHandler = None
 
 def setup_bg_logging(filename, debuglevel):
     global MainQueueHandler
+    logging._srcfile = None             # filename, funcName, lineno, module
+    logging.logThreads = False          # thread, threadName
+    logging.logProcesses = False        # process
+    logging.logMultiprocessing = False  # processName
+    if hasattr(logging, "logAsyncioTasks"):
+        logging.logAsyncioTasks = False # taskName, python 3.12+
     ql = QueueListener(filename)
     MainQueueHandler = QueueHandler(ql.bg_queue)
     root = logging.getLogger()

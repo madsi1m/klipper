@@ -3,7 +3,7 @@
 # Copyright (C) 2018-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import traceback, logging, ast, copy
+import traceback, logging, ast, copy, json
 import jinja2
 
 
@@ -24,9 +24,12 @@ class GetStatusWrapper:
         po = self.printer.lookup_object(sval, None)
         if po is None or not hasattr(po, 'get_status'):
             raise KeyError(val)
+        reactor = self.printer.get_reactor()
         if self.eventtime is None:
-            self.eventtime = self.printer.get_reactor().monotonic()
-        self.cache[sval] = res = copy.deepcopy(po.get_status(self.eventtime))
+            self.eventtime = reactor.monotonic()
+        with reactor.assert_no_pause():
+            sts = po.get_status(self.eventtime)
+        self.cache[sval] = res = copy.deepcopy(sts)
         return res
     def __contains__(self, val):
         try:
@@ -49,6 +52,12 @@ class TemplateWrapper:
         self.create_template_context = gcode_macro.create_template_context
         try:
             self.template = env.from_string(script)
+        except jinja2.exceptions.TemplateSyntaxError as e:
+            lines = script.splitlines()
+            msg = "Error loading template '%s'\nline %s: %s # %s" % (
+                name, e.lineno, lines[e.lineno-1], e.message)
+            logging.exception(msg)
+            raise self.gcode.error(msg)
         except Exception as e:
             msg = "Error loading template '%s': %s" % (
                  name, traceback.format_exception_only(type(e), e)[-1])
@@ -113,6 +122,10 @@ def load_config(config):
 
 class GCodeMacro:
     def __init__(self, config):
+        if len(config.get_name().split()) > 2:
+            raise config.error(
+                    "Name of section '%s' contains illegal whitespace"
+                    % (config.get_name()))
         name = config.get_name().split()[1]
         self.alias = name.upper()
         self.printer = printer = config.get_printer()
@@ -120,6 +133,7 @@ class GCodeMacro:
         self.template = gcode_macro.load_template(config, 'gcode')
         self.gcode = printer.lookup_object('gcode')
         self.rename_existing = config.get("rename_existing", None)
+        self.cmd_desc = config.get("description", "G-Code macro")
         if self.rename_existing is not None:
             if (self.gcode.is_traditional_gcode(self.alias)
                 != self.gcode.is_traditional_gcode(self.rename_existing)):
@@ -135,19 +149,17 @@ class GCodeMacro:
                                         name, self.cmd_SET_GCODE_VARIABLE,
                                         desc=self.cmd_SET_GCODE_VARIABLE_help)
         self.in_script = False
-        prefix = 'default_parameter_'
-        self.kwparams = { o[len(prefix):].upper(): config.get(o)
-                          for o in config.get_prefix_options(prefix) }
         self.variables = {}
         prefix = 'variable_'
         for option in config.get_prefix_options(prefix):
             try:
-                self.variables[option[len(prefix):]] = ast.literal_eval(
-                    config.get(option))
-            except ValueError as e:
+                literal = ast.literal_eval(config.get(option))
+                json.dumps(literal, separators=(',', ':'))
+                self.variables[option[len(prefix):]] = literal
+            except (SyntaxError, TypeError, ValueError) as e:
                 raise config.error(
-                    "Option '%s' in section '%s' is not a valid literal" % (
-                        option, config.get_name()))
+                    "Option '%s' in section '%s' is not a valid literal: %s" % (
+                        option, config.get_name(), e))
     def handle_connect(self):
         prev_cmd = self.gcode.register_command(self.alias, None)
         if prev_cmd is None:
@@ -164,25 +176,23 @@ class GCodeMacro:
         variable = gcmd.get('VARIABLE')
         value = gcmd.get('VALUE')
         if variable not in self.variables:
-            if variable in self.kwparams:
-                self.kwparams[variable] = value
-                return
             raise gcmd.error("Unknown gcode_macro variable '%s'" % (variable,))
         try:
             literal = ast.literal_eval(value)
-        except ValueError as e:
-            raise gcmd.error("Unable to parse '%s' as a literal" % (value,))
-        self.variables[variable] = literal
-    cmd_desc = "G-Code macro"
+            json.dumps(literal, separators=(',', ':'))
+        except (SyntaxError, TypeError, ValueError) as e:
+            raise gcmd.error("Unable to parse '%s' as a literal: %s in '%s'" %
+                             (value, e, gcmd.get_commandline()))
+        v = dict(self.variables)
+        v[variable] = literal
+        self.variables = v
     def cmd(self, gcmd):
         if self.in_script:
             raise gcmd.error("Macro %s called recursively" % (self.alias,))
-        params = gcmd.get_command_parameters()
-        kwparams = dict(self.kwparams)
-        kwparams.update(params)
-        kwparams.update(self.variables)
+        kwparams = dict(self.variables)
         kwparams.update(self.template.create_template_context())
-        kwparams['params'] = params
+        kwparams['params'] = gcmd.get_command_parameters()
+        kwparams['rawparams'] = gcmd.get_raw_command_parameters()
         self.in_script = True
         try:
             self.template.run_gcode_from_command(kwparams)

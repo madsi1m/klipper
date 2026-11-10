@@ -7,12 +7,15 @@
 import logging
 
 BACKGROUND_PRIORITY_CLOCK = 0x7fffffff00000000
-LINE_LENGTH_DEFAULT="20"
-LINE_LENGTH_OPTIONS={"16":16, "20":20}
+LINE_LENGTH_DEFAULT=20
+LINE_LENGTH_OPTIONS=[16, 20]
 
-TextGlyphs = { 'right_arrow': '\x7e' }
+TextGlyphs = { 'right_arrow': b'\x7e' }
 
 HD44780_DELAY = .000040
+# The mcu busy-waits for this delay between bytes, so keep the user
+# configurable value within a small, safe range.
+HD44780_DELAY_MAX = .000060
 
 class HD44780:
     def __init__(self, config):
@@ -22,9 +25,11 @@ class HD44780:
         pins = [ppins.lookup_pin(config.get(name + '_pin'))
                 for name in ['rs', 'e', 'd4', 'd5', 'd6', 'd7']]
         self.hd44780_protocol_init = config.getboolean('hd44780_protocol_init',
-            True)
+                                                       True)
         self.line_length = config.getchoice('line_length', LINE_LENGTH_OPTIONS,
-            LINE_LENGTH_DEFAULT)
+                                            LINE_LENGTH_DEFAULT)
+        self.hd44780_delay = config.getfloat('hd44780_delay', HD44780_DELAY,
+                                             above=0., maxval=HD44780_DELAY_MAX)
         mcu = None
         for pin_params in pins:
             if mcu is not None and pin_params['chip'] != mcu:
@@ -37,24 +42,24 @@ class HD44780:
         self.send_data_cmd = self.send_cmds_cmd = None
         self.icons = {}
         # framebuffers
-        self.text_framebuffers = [bytearray(' '*2*self.line_length),
-                                  bytearray(' '*2*self.line_length)]
+        self.text_framebuffers = [bytearray(b' '*2*self.line_length),
+                                  bytearray(b' '*2*self.line_length)]
         self.glyph_framebuffer = bytearray(64)
         self.all_framebuffers = [
             # Text framebuffers
-            (self.text_framebuffers[0], bytearray('~'*2*self.line_length),
-              0x80),
-            (self.text_framebuffers[1], bytearray('~'*2*self.line_length),
-              0xc0),
+            (self.text_framebuffers[0], bytearray(b'~'*2*self.line_length),
+             0x80),
+            (self.text_framebuffers[1], bytearray(b'~'*2*self.line_length),
+             0xc0),
             # Glyph framebuffer
-            (self.glyph_framebuffer, bytearray('~'*64), 0x40) ]
+            (self.glyph_framebuffer, bytearray(b'~'*64), 0x40) ]
     def build_config(self):
         self.mcu.add_config_cmd(
             "config_hd44780 oid=%d rs_pin=%s e_pin=%s"
             " d4_pin=%s d5_pin=%s d6_pin=%s d7_pin=%s delay_ticks=%d" % (
                 self.oid, self.pins[0], self.pins[1],
                 self.pins[2], self.pins[3], self.pins[4], self.pins[5],
-                self.mcu.seconds_to_clock(HD44780_DELAY)))
+                self.mcu.seconds_to_clock(self.hd44780_delay)))
         cmd_queue = self.mcu.alloc_command_queue()
         self.send_cmds_cmd = self.mcu.lookup_command(
             "hd44780_send_cmds oid=%c cmds=%*s", cq=cmd_queue)
@@ -127,7 +132,7 @@ class HD44780:
     def write_graphics(self, x, y, data):
         pass
     def clear(self):
-        spaces = ' ' * 2*self.line_length
+        spaces = b' ' * 2*self.line_length
         self.text_framebuffers[0][:] = spaces
         self.text_framebuffers[1][:] = spaces
     def get_dimensions(self):

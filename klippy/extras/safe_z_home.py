@@ -3,20 +3,18 @@
 # Copyright (C) 2019 Florian Heilmann <Florian.Heilmann@gmx.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+from . import manual_probe
 
 class SafeZHoming:
     def __init__(self, config):
         self.printer = config.get_printer()
-        try:
-            x_pos, y_pos = config.get("home_xy_position").split(',')
-            self.home_x_pos, self.home_y_pos = float(x_pos), float(y_pos)
-        except:
-            raise config.error("Unable to parse home_xy_position in %s"
-                               % (config.get_name(),))
-
+        x_pos, y_pos = config.getfloatlist("home_xy_position", count=2)
+        self.home_x_pos, self.home_y_pos = x_pos, y_pos
         self.z_hop = config.getfloat("z_hop", default=0.0)
         self.z_hop_speed = config.getfloat('z_hop_speed', 15., above=0.)
-        zconfig = config.getsection('stepper_z')
+        zconfig = manual_probe.lookup_z_endstop_config(config)
+        if zconfig is None:
+            raise config.error('Missing Z endstop config for safe_z_homing')
         self.max_z = zconfig.getfloat('position_max', note_valid=False)
         self.speed = config.getfloat('speed', 50.0, above=0.)
         self.move_to_previous = config.getboolean('move_to_previous', False)
@@ -34,22 +32,22 @@ class SafeZHoming:
 
         # Perform Z Hop if necessary
         if self.z_hop != 0.0:
-            # Check if Z axis is homed or has a known position
+            # Check if Z axis is homed and its last known position
             curtime = self.printer.get_reactor().monotonic()
             kin_status = toolhead.get_kinematics().get_status(curtime)
-            if 'z' in kin_status['homed_axes']:
-                # Check if the zhop would exceed the printer limits
-                pos = toolhead.get_position()
-                if pos[2] + self.z_hop > self.max_z:
-                    gcmd.respond_info(
-                        "No zhop performed, target Z out of bounds: " +
-                        str(pos[2] + self.z_hop))
-                elif pos[2] < self.z_hop:
-                    self._perform_z_hop()
-            else:
-                self._perform_z_hop()
-                if hasattr(toolhead.get_kinematics(), "note_z_not_homed"):
-                    toolhead.get_kinematics().note_z_not_homed()
+            pos = toolhead.get_position()
+
+            if 'z' not in kin_status['homed_axes']:
+                # Always perform the z_hop if the Z axis is not homed
+                pos[2] = 0
+                toolhead.set_position(pos, homing_axes="z")
+                toolhead.manual_move([None, None, self.z_hop],
+                                     self.z_hop_speed)
+                toolhead.get_kinematics().clear_homing_state("z")
+            elif pos[2] < self.z_hop:
+                # If the Z axis is homed, and below z_hop, lift it to z_hop
+                toolhead.manual_move([None, None, self.z_hop],
+                                     self.z_hop_speed)
 
         # Determine which axes we need to home
         need_x, need_y, need_z = [gcmd.get(axis, None) is not None
@@ -83,17 +81,13 @@ class SafeZHoming:
             self.prev_G28(g28_gcmd)
             # Perform Z Hop again for pressure-based probes
             if self.z_hop:
-                toolhead.manual_move([None, None, self.z_hop], self.z_hop_speed)
+                pos = toolhead.get_position()
+                if pos[2] < self.z_hop:
+                    toolhead.manual_move([None, None, self.z_hop],
+                                         self.z_hop_speed)
             # Move XY back to previous positions
             if self.move_to_previous:
                 toolhead.manual_move(prevpos[:2], self.speed)
-
-    def _perform_z_hop(self):
-        toolhead = self.printer.lookup_object('toolhead')
-        # Perform the Z-Hop
-        pos = toolhead.get_position()
-        toolhead.set_position(pos, homing_axes=[2])
-        toolhead.manual_move([None, None, pos[2]+self.z_hop], self.z_hop_speed)
 
 def load_config(config):
     return SafeZHoming(config)

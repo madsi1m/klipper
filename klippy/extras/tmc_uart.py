@@ -1,6 +1,6 @@
 # Helper code for communicating with TMC stepper drivers via UART
 #
-# Copyright (C) 2018-2019  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2018-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
@@ -16,7 +16,7 @@ class MCU_analog_mux:
         self.cmd_queue = cmd_queue
         ppins = mcu.get_printer().lookup_object("pins")
         select_pin_params = [ppins.lookup_pin(spd, can_invert=True)
-                             for spd in select_pins_desc.split(',')]
+                             for spd in select_pins_desc]
         self.oids = [self.mcu.create_oid() for pp in select_pin_params]
         self.pins = [pp['pin'] for pp in select_pin_params]
         self.pin_values = tuple([-1 for pp in select_pin_params])
@@ -32,7 +32,7 @@ class MCU_analog_mux:
     def get_instance_id(self, select_pins_desc):
         ppins = self.mcu.get_printer().lookup_object("pins")
         select_pin_params = [ppins.parse_pin(spd, can_invert=True)
-                             for spd in select_pins_desc.split(',')]
+                             for spd in select_pins_desc]
         for pin_params in select_pin_params:
             if pin_params['chip'] != self.mcu:
                 raise self.mcu.get_printer().config_error(
@@ -70,7 +70,8 @@ def lookup_tmc_uart_mutex(mcu):
         pmutexes.mcu_to_mutex[mcu] = mutex
     return mutex
 
-TMC_BAUD_RATE = 9000
+TMC_BAUD_RATE = 40000
+TMC_BAUD_RATE_AVR = 9000
 
 # Code for sending messages on a TMC uart
 class MCU_TMC_uart_bitbang:
@@ -90,7 +91,11 @@ class MCU_TMC_uart_bitbang:
         self.tmcuart_send_cmd = None
         self.mcu.register_config_callback(self.build_config)
     def build_config(self):
-        bit_ticks = self.mcu.seconds_to_clock(1. / TMC_BAUD_RATE)
+        baud = TMC_BAUD_RATE
+        mcu_type = self.mcu.get_constants().get("MCU", "")
+        if mcu_type.startswith("atmega") or mcu_type.startswith("at90usb"):
+            baud = TMC_BAUD_RATE_AVR
+        bit_ticks = self.mcu.seconds_to_clock(1. / baud)
         self.mcu.add_config_cmd(
             "config_tmcuart oid=%d rx_pin=%s pull_up=%d tx_pin=%s bit_time=%d"
             % (self.oid, self.rx_pin, self.pullup, self.tx_pin, bit_ticks))
@@ -170,7 +175,10 @@ class MCU_TMC_uart_bitbang:
             self.analog_mux.activate(instance_id)
         msg = self._encode_read(0xf5, addr, reg)
         params = self.tmcuart_send_cmd.send([self.oid, msg, 10])
-        return self._decode_read(reg, params['read'])
+        return {
+            'data': self._decode_read(reg, params['read']),
+            '#receive_time': params['#receive_time']
+        }
     def reg_write(self, instance_id, addr, reg, val, print_time=None):
         minclock = 0
         if print_time is not None:
@@ -179,12 +187,14 @@ class MCU_TMC_uart_bitbang:
             self.analog_mux.activate(instance_id)
         msg = self._encode_write(0xf5, addr, reg | 0x80, val)
         self.tmcuart_send_cmd.send([self.oid, msg, 0], minclock=minclock)
+    def get_mcu(self):
+        return self.mcu
 
 # Lookup a (possibly shared) tmc uart
 def lookup_tmc_uart_bitbang(config, max_addr):
     ppins = config.get_printer().lookup_object("pins")
-    rx_pin_params = ppins.lookup_pin(
-        config.get('uart_pin'), can_pullup=True, share_type="tmc_uart_rx")
+    rx_pin_params = ppins.lookup_pin(config.get('uart_pin'), can_pullup=True,
+                                     share_type="tmc_uart_rx")
     tx_pin_desc = config.get('tx_pin', None)
     if tx_pin_desc is None:
         tx_pin_params = rx_pin_params
@@ -192,7 +202,7 @@ def lookup_tmc_uart_bitbang(config, max_addr):
         tx_pin_params = ppins.lookup_pin(tx_pin_desc, share_type="tmc_uart_tx")
     if rx_pin_params['chip'] is not tx_pin_params['chip']:
         raise ppins.error("TMC uart rx and tx pins must be on the same mcu")
-    select_pins_desc = config.get('select_pins', None)
+    select_pins_desc = config.getlist('select_pins', None)
     addr = config.getint('uart_address', 0, minval=0, maxval=max_addr)
     mcu_uart = rx_pin_params.get('class')
     if mcu_uart is None:
@@ -205,7 +215,7 @@ def lookup_tmc_uart_bitbang(config, max_addr):
 
 # Helper code for communicating via TMC uart
 class MCU_TMC_uart:
-    def __init__(self, config, name_to_reg, fields, max_addr=0):
+    def __init__(self, config, name_to_reg, fields, max_addr, tmc_frequency):
         self.printer = config.get_printer()
         self.name = config.get_name().split()[-1]
         self.name_to_reg = name_to_reg
@@ -214,21 +224,27 @@ class MCU_TMC_uart:
         self.instance_id, self.addr, self.mcu_uart = lookup_tmc_uart_bitbang(
             config, max_addr)
         self.mutex = self.mcu_uart.mutex
+        self.tmc_frequency = tmc_frequency
     def get_fields(self):
         return self.fields
     def _do_get_register(self, reg_name):
         reg = self.name_to_reg[reg_name]
         if self.printer.get_start_args().get('debugoutput') is not None:
-            return 0
+            return {
+                'data': 0,
+                '#receive_time': 0.
+            }
         for retry in range(5):
             val = self.mcu_uart.reg_read(self.instance_id, self.addr, reg)
-            if val is not None:
+            if val['data'] is not None:
                 return val
         raise self.printer.command_error(
             "Unable to read tmc uart '%s' register %s" % (self.name, reg_name))
-    def get_register(self, reg_name):
+    def get_register_raw(self, reg_name):
         with self.mutex:
             return self._do_get_register(reg_name)
+    def get_register(self, reg_name):
+        return self.get_register_raw(reg_name)['data']
     def set_register(self, reg_name, val, print_time=None):
         reg = self.name_to_reg[reg_name]
         if self.printer.get_start_args().get('debugoutput') is not None:
@@ -237,11 +253,15 @@ class MCU_TMC_uart:
             for retry in range(5):
                 ifcnt = self.ifcnt
                 if ifcnt is None:
-                    self.ifcnt = ifcnt = self._do_get_register("IFCNT")
+                    self.ifcnt = ifcnt = self._do_get_register("IFCNT")['data']
                 self.mcu_uart.reg_write(self.instance_id, self.addr, reg, val,
                                         print_time)
-                self.ifcnt = self._do_get_register("IFCNT")
+                self.ifcnt = self._do_get_register("IFCNT")['data']
                 if self.ifcnt == (ifcnt + 1) & 0xff:
                     return
         raise self.printer.command_error(
             "Unable to write tmc uart '%s' register %s" % (self.name, reg_name))
+    def get_tmc_frequency(self):
+        return self.tmc_frequency
+    def get_mcu(self):
+        return self.mcu_uart.get_mcu()

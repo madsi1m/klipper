@@ -11,10 +11,12 @@
 #include "gpio.h" // i2c_setup
 #include "internal.h" // GPIO
 #include "sched.h" // sched_shutdown
+#include "i2ccmds.h" // I2C_BUS_SUCCESS
 
 DECL_ENUMERATION("i2c_bus", "twi", 0);
 
-#if CONFIG_MACH_atmega168 || CONFIG_MACH_atmega328 || CONFIG_MACH_atmega328p
+#if CONFIG_MACH_atmega168 || CONFIG_MACH_atmega328 \
+      || CONFIG_MACH_atmega328p || CONFIG_MACH_lgt8f328p
 static const uint8_t SCL = GPIO('C', 5), SDA = GPIO('C', 4);
 DECL_CONSTANT_STR("BUS_PINS_twi", "PC5,PC4");
 #elif CONFIG_MACH_atmega644p || CONFIG_MACH_atmega1284p
@@ -27,31 +29,27 @@ static const uint8_t SCL = GPIO('D', 0), SDA = GPIO('D', 1);
 DECL_CONSTANT_STR("BUS_PINS_twi", "PD0,PD1");
 #endif
 
-static void
-i2c_init(void)
-{
-    if (TWCR & (1<<TWEN))
-        // Already setup
-        return;
-
-    // Setup output pins and enable pullups
-    gpio_out_setup(SDA, 1);
-    gpio_out_setup(SCL, 1);
-
-    // Set 100Khz frequency
-    TWSR = 0;
-    TWBR = ((CONFIG_CLOCK_FREQ / 100000) - 16) / 2;
-
-    // Enable interface
-    TWCR = (1<<TWEN);
-}
-
 struct i2c_config
 i2c_setup(uint32_t bus, uint32_t rate, uint8_t addr)
 {
     if (bus)
         shutdown("Unsupported i2c bus");
-    i2c_init();
+
+    if (!(TWCR & (1<<TWEN))) {
+        // Setup output pins and enable pullups
+        gpio_out_setup(SDA, 1);
+        gpio_out_setup(SCL, 1);
+
+        // Set frequency avoiding pulling in integer divide
+        TWSR = 0;
+        if (rate >= 400000)
+            TWBR = ((CONFIG_CLOCK_FREQ / 400000) - 16) / 2;
+        else
+            TWBR = ((CONFIG_CLOCK_FREQ / 100000) - 16) / 2;
+
+        // Enable interface
+        TWCR = (1<<TWEN);
+    }
     return (struct i2c_config){ .addr=addr<<1 };
 }
 
@@ -98,7 +96,7 @@ i2c_stop(uint32_t timeout)
     TWCR = (1<<TWEN) | (1<<TWINT) | (1<<TWSTO);
 }
 
-void
+int
 i2c_write(struct i2c_config config, uint8_t write_len, uint8_t *write)
 {
     uint32_t timeout = timer_read_time() + timer_from_us(5000);
@@ -108,9 +106,11 @@ i2c_write(struct i2c_config config, uint8_t write_len, uint8_t *write)
     while (write_len--)
         i2c_send_byte(*write++, timeout);
     i2c_stop(timeout);
+
+    return I2C_BUS_SUCCESS;
 }
 
-void
+int
 i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
          , uint8_t read_len, uint8_t *read)
 {
@@ -124,4 +124,6 @@ i2c_read(struct i2c_config config, uint8_t reg_len, uint8_t *reg
     while (read_len--)
         i2c_receive_byte(read++, timeout, read_len);
     i2c_stop(timeout);
+
+    return I2C_BUS_SUCCESS;
 }
